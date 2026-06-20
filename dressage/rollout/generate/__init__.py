@@ -1,0 +1,2 @@
+"""Slime custom generation hooks."""
+

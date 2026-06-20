@@ -1,0 +1,11 @@
+Dressage
+Copyright 2026 Dressage contributors
+
+This product includes software developed by the Dressage contributors.
+
+This repository includes slime as a git submodule. slime is distributed under
+the Apache License, Version 2.0. See slime/LICENSE for its license text.
+
+The Docker setup can install opencode and openclaw using their public install
+scripts. Those tools are not source code distributed by this repository; review
+their upstream licenses and terms before redistribution.

@@ -1,0 +1,456 @@
+"""Rollout sample artifact construction helpers."""
+
+from __future__ import annotations
+
+import copy
+import logging
+import uuid
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+def _load_slime_sample():
+    try:
+        from slime.utils.types import Sample
+
+        return Sample
+    except ImportError:
+        return None
+
+
+def _status(sample: Any, name: str):
+    sample_cls = _load_slime_sample()
+    if sample_cls is not None:
+        return getattr(sample_cls.Status, name)
+    status_cls = getattr(sample, "Status", None)
+    if status_cls is not None:
+        return getattr(status_cls, name)
+    return name.lower()
+
+
+def set_status(sample: Any, name: str) -> None:
+    sample.status = _status(sample, name)
+
+
+def instance_id(sample: Any) -> str:
+    metadata = getattr(sample, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    value = metadata.get("instance_id")
+    if value is not None:
+        return str(value)
+    group_index = getattr(sample, "group_index", None)
+    return str(group_index if group_index is not None else uuid.uuid4())
+
+
+def select_last_segment(data: list[dict[str, Any]]) -> dict[str, Any]:
+    if not data:
+        raise ValueError("proxy returned no trajectory segments")
+    return sorted(
+        data,
+        key=lambda item: (
+            int(item.get("segment_index", 0)),
+            float(item.get("timestamp") or 0.0),
+        ),
+    )[-1]
+
+
+def copy_sample_with_metadata(sample: Any, *, metadata: dict[str, Any]) -> Any:
+    sample_copy = copy.copy(sample)
+    sample_copy.metadata = dict(metadata)
+    return sample_copy
+
+
+def sample_artifact_payload(
+    sample: Any,
+    *,
+    segment: dict[str, Any],
+    all_segments: list[dict[str, Any]],
+    session_id: str,
+    instance_id: str,
+) -> dict[str, Any]:
+    segment_index = segment.get("segment_index", 0)
+    metadata = getattr(sample, "metadata", None)
+    return {
+        "session_id": session_id,
+        "trajectory_id": session_id,
+        "instance_id": instance_id,
+        "segment_index": segment_index,
+        "segment_uid": segment.get("uid"),
+        "segment_count": len(all_segments),
+        "prompt": getattr(sample, "prompt", None),
+        "label": getattr(sample, "label", None),
+        "response": getattr(sample, "response", None),
+        "tokens": getattr(sample, "tokens", None),
+        "response_length": getattr(sample, "response_length", None),
+        "loss_mask": getattr(sample, "loss_mask", None),
+        "rollout_log_probs": getattr(sample, "rollout_log_probs", None),
+        "reward": getattr(sample, "reward", None),
+        "status": getattr(sample, "status", None),
+        "metadata": metadata if isinstance(metadata, dict) else {},
+    }
+
+
+def _last_assistant_content(messages: list[dict[str, Any]], fallback: str = "") -> str:
+    for message in reversed(messages):
+        if message.get("role") == "assistant":
+            content = message.get("content")
+            if content is not None:
+                return str(content)
+    return fallback
+
+
+def _required_segment_list(segment: dict[str, Any], key: str) -> list[Any]:
+    if key not in segment:
+        raise ValueError(f"selected segment missing required field: {key}")
+    value = segment[key]
+    if value is None:
+        raise ValueError(f"selected segment field is null: {key}")
+    try:
+        return list(value)
+    except TypeError as exc:
+        raise ValueError(f"selected segment field is not a list: {key}") from exc
+
+
+def _normalize_segment_loss_mask(values: list[Any]) -> list[int]:
+    normalized: list[int] = []
+    for index, value in enumerate(values):
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError(f"full_loss_mask[{index}] is not 0 or 1: {value!r}")
+        try:
+            mask_value = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"full_loss_mask[{index}] cannot be converted to int: {value!r}"
+            ) from exc
+        if mask_value not in (0, 1):
+            raise ValueError(f"full_loss_mask[{index}] is not 0 or 1: {value!r}")
+        normalized.append(mask_value)
+    return normalized
+
+
+def _normalize_segment_logprobs(values: list[Any]) -> list[float]:
+    normalized: list[float] = []
+    for index, value in enumerate(values):
+        try:
+            normalized.append(float(value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"full_logprobs[{index}] cannot be converted to float: {value!r}"
+            ) from exc
+    return normalized
+
+
+def _normalize_segment_versions(values: list[Any]) -> list[str]:
+    return ["unknown" if value is None else str(value) for value in values]
+
+
+def _compress_version_spans(versions: list[str]) -> list[dict[str, Any]]:
+    if not versions:
+        return []
+
+    spans: list[dict[str, Any]] = []
+    start = 0
+    current = versions[0]
+    for index, version in enumerate(versions[1:], start=1):
+        if version == current:
+            continue
+        spans.append({"start": start, "end": index, "version": current})
+        start = index
+        current = version
+    spans.append({"start": start, "end": len(versions), "version": current})
+    return spans
+
+
+def _is_real_output_version(version: str) -> bool:
+    return version.strip().lower() not in {"", "-1", "unknown", "none"}
+
+
+def _trainable_output_versions(
+    full_loss_mask: list[int],
+    full_versions: list[str],
+) -> list[str]:
+    return [
+        version
+        for loss_mask, version in zip(full_loss_mask, full_versions)
+        if int(loss_mask) == 1 and _is_real_output_version(version)
+    ]
+
+
+def _trainable_output_version_bounds(
+    full_loss_mask: list[int],
+    full_versions: list[str],
+) -> tuple[str, str] | None:
+    versions = _trainable_output_versions(full_loss_mask, full_versions)
+    if not versions:
+        return None
+    return versions[0], versions[-1]
+
+
+def _has_token_level_partial_rollout(
+    full_loss_mask: list[int],
+    full_versions: list[str],
+) -> bool:
+    return len(set(_trainable_output_versions(full_loss_mask, full_versions))) > 1
+
+
+def _mask_nonlast_version_tokens(
+    full_loss_mask: list[int],
+    full_versions: list[str],
+) -> list[int]:
+    trainable_versions = _trainable_output_versions(full_loss_mask, full_versions)
+    if len(set(trainable_versions)) <= 1:
+        return list(full_loss_mask)
+
+    last_version = trainable_versions[-1]
+    return [
+        1
+        if int(mask_value) == 1
+        and _is_real_output_version(version)
+        and version == last_version
+        else 0
+        for mask_value, version in zip(full_loss_mask, full_versions)
+    ]
+
+
+def _segment_masks_nonlast_version_tokens(segment: dict[str, Any]) -> bool:
+    extra_info = segment.get("extra_info") or {}
+    return bool(extra_info.get("mask_nonlast_version_tokens"))
+
+
+def _segment_arrays(
+    segment: dict[str, Any],
+) -> tuple[list[Any], list[int], list[float], list[str] | None]:
+    tokens = _required_segment_list(segment, "tokens")
+    full_loss_mask = _normalize_segment_loss_mask(
+        _required_segment_list(segment, "full_loss_mask")
+    )
+    full_logprobs = _normalize_segment_logprobs(
+        _required_segment_list(segment, "full_logprobs")
+    )
+    raw_versions = segment.get("full_versions")
+    full_versions = (
+        None
+        if raw_versions is None
+        else _normalize_segment_versions(_required_segment_list(segment, "full_versions"))
+    )
+    if not tokens:
+        raise ValueError("selected segment has empty tokens")
+    if len(tokens) != len(full_loss_mask):
+        raise ValueError(
+            f"tokens length {len(tokens)} != full_loss_mask length {len(full_loss_mask)}"
+        )
+    if len(tokens) != len(full_logprobs):
+        raise ValueError(
+            "tokens length "
+            f"{len(tokens)} != full_logprobs length {len(full_logprobs)}"
+        )
+    if full_versions is not None and len(tokens) != len(full_versions):
+        raise ValueError(
+            "tokens length "
+            f"{len(tokens)} != full_versions length {len(full_versions)}"
+        )
+    return tokens, full_loss_mask, full_logprobs, full_versions
+
+
+def _segment_token_cap(args: Any) -> int | None:
+    max_tokens_per_gpu = getattr(args, "max_tokens_per_gpu", None)
+    if max_tokens_per_gpu is None:
+        return None
+    cp_size = getattr(args, "context_parallel_size", None)
+    if cp_size is None:
+        cp_size = getattr(args, "cp_size", 1)
+    return int(max_tokens_per_gpu) * int(cp_size)
+
+
+def write_sample_from_segment(
+    sample: Any,
+    *,
+    args: Any,
+    segment: dict[str, Any],
+    all_segments: list[dict[str, Any]],
+    session_id: str,
+    instance_id: str,
+    agent_response: str,
+) -> Any:
+    tokens, full_loss_mask, full_logprobs, full_versions = _segment_arrays(segment)
+    origin_tokens_len = len(tokens)
+    token_cap = _segment_token_cap(args)
+    truncated = token_cap is not None and origin_tokens_len > token_cap
+    if truncated:
+        tokens = tokens[:token_cap]
+        full_loss_mask = full_loss_mask[:token_cap]
+        full_logprobs = full_logprobs[:token_cap]
+        if full_versions is not None:
+            full_versions = full_versions[:token_cap]
+        logger.warning(
+            "segment truncated for session_id=%s, instance_id=%s, segment_index=%s: %s > %s",
+            session_id,
+            instance_id,
+            segment.get("segment_index", 0),
+            origin_tokens_len,
+            token_cap,
+        )
+
+    train_full_loss_mask = full_loss_mask
+    if full_versions is not None and _segment_masks_nonlast_version_tokens(segment):
+        train_full_loss_mask = _mask_nonlast_version_tokens(full_loss_mask, full_versions)
+
+    response_start = next(
+        (idx for idx, value in enumerate(full_loss_mask) if value == 1),
+        len(tokens),
+    )
+    response_length = len(tokens) - response_start
+
+    sample.tokens = tokens
+    sample.response_length = response_length
+    sample.loss_mask = train_full_loss_mask[response_start:]
+    sample.rollout_log_probs = full_logprobs[response_start:]
+    if len(sample.loss_mask) != response_length:
+        raise ValueError(
+            f"loss_mask length {len(sample.loss_mask)} != response_length {response_length}"
+        )
+    if len(sample.rollout_log_probs) != response_length:
+        raise ValueError(
+            "rollout_log_probs length "
+            f"{len(sample.rollout_log_probs)} != response_length {response_length}"
+        )
+
+    messages = segment.get("messages") or []
+    sample.response = _last_assistant_content(messages, fallback=agent_response)
+    sample.metadata["session_id"] = session_id
+    sample.metadata["instance_id"] = instance_id
+    sample.metadata["messages"] = messages
+    sample.metadata["proxy_extra_info"] = segment.get("extra_info") or {}
+    sample.metadata.pop("dressage_partial_rollout", None)
+    sample.metadata.pop("dressage_async_group_id", None)
+    sample.metadata.pop("response_versions", None)
+    sample.metadata.pop("response_version_spans", None)
+    sample.metadata.pop("dressage_start_token_version", None)
+    sample.metadata.pop("dressage_end_token_version", None)
+    sample.metadata.pop("full_versions", None)
+    sample.metadata.pop("version_spans", None)
+    if full_versions is not None:
+        sample.metadata["full_versions"] = list(full_versions)
+        sample.metadata["version_spans"] = _compress_version_spans(list(full_versions))
+        version_bounds = _trainable_output_version_bounds(full_loss_mask, full_versions)
+        if version_bounds is not None:
+            start_token_version, end_token_version = version_bounds
+            sample.metadata["dressage_start_token_version"] = start_token_version
+            sample.metadata["dressage_end_token_version"] = end_token_version
+        if _has_token_level_partial_rollout(full_loss_mask, full_versions):
+            sample.metadata["dressage_partial_rollout"] = True
+    sample.metadata["segment_count"] = len(all_segments)
+    sample.metadata["selected_segment_index"] = segment.get("segment_index", 0)
+    sample.metadata["all_segment_uids"] = [
+        item.get("uid") for item in all_segments if item.get("uid") is not None
+    ]
+    if truncated:
+        sample.metadata["truncated"] = True
+    routed_experts = extract_routed_experts(
+        segment,
+        args,
+        expected_token_count=len(tokens),
+    )
+    if routed_experts is not None:
+        expected_len = len(tokens) - 1
+        if routed_experts.shape[0] > expected_len:
+            routed_experts = routed_experts[:expected_len]
+        if routed_experts.shape[0] != expected_len:
+            logger.warning(
+                "routed_experts length %d != expected %d; skipping R3",
+                routed_experts.shape[0], expected_len,
+            )
+            routed_experts = None
+    if routed_experts is not None:
+        sample.rollout_routed_experts = routed_experts
+    elif getattr(args, "use_rollout_routing_replay", False):
+        raise ValueError(
+            "use_rollout_routing_replay is enabled but segment contains no routed_experts. "
+            "Pass --use-rollout-routing-replay when starting the Dressage proxy."
+        )
+
+    finish_reason = str(segment.get("finish_reason") or "stop")
+    set_status(sample, "TRUNCATED" if finish_reason == "length" else "COMPLETED")
+    return sample
+
+
+def extract_routed_experts(
+    segment: dict[str, Any], args: Any, *, expected_token_count: int = 0,
+) -> Any:
+    num_layers = getattr(args, "num_layers", None)
+    moe_router_topk = getattr(args, "moe_router_topk", None)
+    if num_layers is None or moe_router_topk is None:
+        return None
+
+    import numpy as np
+
+    try:
+        import pybase64
+    except ImportError:
+        import base64 as pybase64
+
+    def decode(data_b64: str) -> Any:
+        return np.frombuffer(
+            pybase64.b64decode(data_b64.encode("ascii")),
+            dtype=np.int32,
+        ).reshape(-1, num_layers, moe_router_topk)
+
+    def slice_generated(
+        full_array: Any,
+        prefix_count: int,
+        output_count: int,
+        is_first: bool,
+    ) -> Any:
+        if is_first:
+            return full_array[:prefix_count + output_count - 1]
+        start = prefix_count - 1
+        return full_array[start:start + output_count]
+
+    def combine_chunks(chunks_info: list[dict[str, Any]]) -> Any:
+        slices = [
+            slice_generated(
+                decode(chunk["data"]),
+                int(chunk["prefix_token_count"]),
+                int(chunk["output_token_count"]),
+                bool(chunk.get("is_first_chunk")),
+            )
+            for chunk in chunks_info
+        ]
+        return np.concatenate(slices, axis=0) if slices else None
+
+    def check_min_length(result: Any) -> Any:
+        if expected_token_count > 0 and result.shape[0] < expected_token_count - 1:
+            logger.warning(
+                "routed_experts too short: got %d, expected >= %d; skipping R3",
+                result.shape[0], expected_token_count - 1,
+            )
+            return None
+        return result
+
+    chunks_info = segment.get("routed_experts_chunks")
+    if chunks_info:
+        return check_min_length(combine_chunks(chunks_info))
+
+    raw = segment.get("routed_experts")
+    if raw is not None and isinstance(raw, str):
+        return check_min_length(decode(raw))
+
+    parts_info = segment.get("routed_experts_parts")
+    if not parts_info:
+        return None
+
+    slices = []
+    for part in parts_info:
+        if part.get("chunks"):
+            step_array = combine_chunks(part["chunks"])
+        else:
+            step_array = decode(part["data"])
+        prefix_count = int(part["prefix_token_count"])
+        concat_count = int(part["concat_token_count"])
+        is_first = bool(part.get("is_first_step"))
+        slices.append(slice_generated(step_array, prefix_count, concat_count, is_first))
+
+    if not slices:
+        return None
+    return check_min_length(np.concatenate(slices, axis=0))
